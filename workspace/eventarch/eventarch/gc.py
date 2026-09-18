@@ -480,6 +480,12 @@ class GCManager:
         # checkpoint hold unsettled/unread messages and are untouchable.
         groups = getattr(self.s, "groups", None)
         group_bounds = groups.gate_boundaries_locked() if groups else []
+        # Active derived-lineage pipelines hold every source segment they
+        # still need to scan; the pin is released only when the pipeline
+        # completes or is aborted.
+        projections = getattr(self.s, "projections", None)
+        projection_pins = (projections.dependency_segments_locked()
+                           if projections is not None else set())
         out = []
         for m in self.s.manifest["segments"]:
             if m["status"] != "sealed":
@@ -487,7 +493,8 @@ class GCManager:
             if m["last_offset"] >= cut:
                 continue
             if m["id"] in snap or m["id"] in active_repairs \
-                    or m["id"] in self._pending:
+                    or m["id"] in self._pending \
+                    or m["id"] in projection_pins:
                 continue
             if self._is_held_locked(m, now):
                 continue

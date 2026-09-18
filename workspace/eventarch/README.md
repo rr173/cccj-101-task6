@@ -98,7 +98,12 @@ make smoke    # 端到端：起服务→分类→冻结→重启→损坏→隔�
 | `POST /v2/groups/{name}/settle` | 交卷 `{holder, lease_key, batch_key, next_at}`；重复提交视为办妥；倒退/跨批/虚构批号/失效凭证 `409` 且 checkpoint 不动 |
 | `POST /v2/groups/{name}/pause` · `POST /v2/groups/{name}/resume` | 暂停（撤水闸、释放租约）/ 从原 checkpoint 恢复 |
 | `DELETE /v2/groups/{name}` | 注销：撤水闸、删除登记 |
-| `GET /v1/stats` · `GET /v1/healthz` | 运行指标（含 `gc` 段）/ 健康检查 |
+| `POST /v3/views` | 封存一个**管线专用静态视界**（封存开放段、钉住 end_offset；视图以后抵达的原始内容永不入管） |
+| `GET /v3/views` | 静态视界列表 |
+| `POST /v3/projections` | 开立/幂等重提派生谱系管线（唯一管线号 + 视图令牌 + 源白名单 + 首尾游标 + 字段配方 + 配方代号 + 目标前缀） |
+| `GET /v3/projections` · `GET /v3/projections/{id}` | 管线清单 / 恒定答复（阶段、输入视界摘要、派生清单、接续游标、缺口、占用分片） |
+| `POST /v3/projections/{id}/control` | `{action: pause\|resume\|abort, epoch}`：单调代数控制，旧令牌一律 409 |
+| `GET /v1/stats` · `GET /v1/healthz` | 运行指标（含 `gc`/`groups`/`projections` 段）/ 健康检查 |
 
 ### 冻结与回放
 
@@ -284,6 +289,79 @@ curl -XPOST localhost:8080/v2/groups/etl/settle \
 - **不阻塞前台**：领取的段扫描 I/O 在全局锁外进行（与 replay 相同），订阅
   不会拖慢常规接入、查找、冻结、整治或容量回收。
 
+## 派生谱系管线（/v3/projections）
+
+按声明视图异步扫描原始条目，派生条目写入**普通目标流**（终端名
+`<target_prefix><源设备号>`），每条带完整血缘：`lineage_id`（血缘条目号）、
+`recipe_code`（配方代号）、`generated_at`（生成时刻）、源 offset/event/设备、
+以及继承自源条目的 `late` / `clock_rollback` 标记；终端序号按目标流单独编排。
+普通取数（设备查询、无 freeze 的 replay）立即可见这些新条目。
+
+```bash
+# 1. 封存静态视界（此后抵达的原始内容不可能进入该管线）
+vw=$(curl -s -XPOST localhost:8080/v3/views -d '{"note":"nightly"}'
+     | python3 -c 'import sys,json;print(json.load(sys.stdin)["token"])')
+
+# 2. 开立管线（管线号是跨进程幂等钥匙）
+curl -s -XPOST localhost:8080/v3/projections -d "{
+  \"pipeline_id\": \"pj-20260918-01\",
+  \"view_token\": \"$vw\",
+  \"sources\": [\"dev-A\", \"dev-B\"],
+  \"from_offset\": 0, \"to_offset\": 12000,
+  \"recipe\": {
+     \"temp\": {\"source\": \"payload.temp\"},
+     \"src\":  {\"source\": \"event_id\"},
+     \"kind\": {\"const\": \"derived\"},
+     \"note\": {\"source\": \"payload.missing\", \"default\": \"\"}
+  },
+  \"recipe_code\": \"RCP-temp-v1\",
+  \"target_prefix\": \"agg-\",
+  \"batch_size\": 200
+}"
+
+# 3. 轮询恒定答复：阶段 / 输入视界摘要 / 派生清单 / 接续游标
+curl localhost:8080/v3/projections/pj-20260918-01
+
+# 4. 暂停 / 恢复 / 撤销（代数必须严格递增，旧令牌 409）
+curl -XPOST localhost:8080/v3/projections/pj-20260918-01/control \
+     -d '{"action":"pause","epoch":1}'
+curl -XPOST .../control -d '{"action":"resume","epoch":2}'
+curl -XPOST .../control -d '{"action":"abort","epoch":3}'
+```
+
+语义要点：
+
+- **跨进程幂等**：连点、两台 worker 同开、网络重试，同号只得到同一条管线，
+  绝不多造条目。同号请求若改动视图、首尾游标、字段配方、源白名单或目标前缀，
+  整单 `409`（逐条给出差异），原管线/原清单一字不动。
+- **只取声明视图**：`/v3/views` 在开立瞬间封存开放段并钉住视界（也接受既有
+  v1 freeze 令牌）。视界以后抵达的原始内容落在更高 offset，永远不会混入；
+  同号配方重跑也不延长视界。
+- **恒定派生身份**：血缘条目号 =
+  `sha1(配方代号|配方体指纹|视图令牌|源offset)`，与执行管线无关——同号配方执行
+  同号血缘条目得到恒定身份；派生事件号再纳入管线号与目标前缀作为终端内去重键，
+  崩溃重放天然幂等，不会双写。
+- **封存缺口不藏**：扫描区间内的源分片被隔离（quarantine）时，管线转入
+  `blocked`，`gaps[]` 逐段给出 `{segment, reason, resume_offset,
+  first_offset, last_offset, terminals[]}`（精确接续游标 + 受影响终端）；修复后
+  后台自动从该游标续跑，已越过的健康前缀不重扫、隔离段的 offset 绝不静默跳过。
+  建立时若区间已跨入清退区，返回 `410` + 精确可用起点。
+- **分片占用**：未完（含暂停/阻塞）管线持续钉住依赖分片，GC 预演不会选中；
+  完成或撤销后立即释放占用、进入回收候选。
+- **并发**：源分片扫描的重 I/O 全部在全局锁外，与摄取、终端查找、视图创建、
+  整治、空间回收同时进行；扫描与提交之间分片代数（meta `version`）漂移时丢弃
+  本批过时落盘、重新核对。同号源端被另一条活管线的重叠区间占用时，双方都收到
+  点名的 `409`（既有管线记录对端 `conflicts[]`）。
+- **控制代数**：`pause/resume/abort` 携带严格递增的 `epoch`；相等或更旧的令牌
+  一律 `409`，不能改写新阶段。终态（succeeded/aborted）后任何控制均被拒绝。
+- **崩溃安全（四个强制中止点）**：`state/projections.json` 保存管线清单、接续
+  游标、派生索引、依赖分片集合与终态答复；每批顺序为
+  ①清单/批意图落盘 → ②单批派生条目 WAL 刷盘 → ③游标与派生索引发布 →
+  ④终态标记，每个接缝可注入强制中止。重启只对账最后完整批：按确定性事件号幂等
+  重刷（重复返回原 offset，不产生半条/双份条目），游标与索引按批一次性推进。
+- **生成时刻确定性**：派生条目的 `generated_at` 取源条目接收时刻，配方重跑与
+  崩溃恢复得到完全一致的派生记录。
+
 ## 持久化与故障语义
 
 ```
@@ -301,6 +379,7 @@ $data_dir/
   state/holds.json                 # 读者保护区（hold_id/pos/边界/过期时刻）
   state/groups.json                # 消费组声明、checkpoint、epoch、租约、待交卷批次
   state/group_gates.json           # 回收水闸台账（由 checkpoint 派生，启动对账）
+  state/projections.json           # v3 静态视界 + 管线清单/游标/派生索引/依赖集合/终态答复
   segments/stage-<job>-<n>/<seg>/  # 修复候选（提交前不触碰 live）
   segments/bak-<job>-<n>/<seg>/    # 原子交换期间的旧段（提交后删除）
   segments/gcgrave-<job>/<seg>/    # GC 目录换位后、audit 前的临时墓场
@@ -332,6 +411,8 @@ $data_dir/
 | `EA_REPAIR_HISTORY` | `100` | 作业日志保留的终态作业条数（活动作业不裁剪） |
 | `EA_GC_WORKERS` | `1` | 后台清退作业并发工作线程数 |
 | `EA_GC_HISTORY` | `100` | 清退作业日志保留的终态作业条数（活动作业不裁剪） |
+| `EA_PROJECTION_WORKERS` | `1` | 派生管线后台扫描并发工作线程数 |
+| `EA_PROJECTION_BATCH_SIZE` | `200` | 每批扫描并刷盘的派生条目数默认值（请求可覆盖，≤`EA_MAX_BATCH`） |
 
 ## 设计取舍与限制
 

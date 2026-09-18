@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Tuple
 
 from . import gc as gcmod
 from . import groups as groupsmod
+from . import projections as projmod
 from . import segments as segmod
 from . import wal as walmod
 from .models import fmt_ts, new_flags, parse_ts, utcnow, validate_event
@@ -132,6 +133,8 @@ class ArchiveStore:
         # Persistent consumer groups (declarations, checkpoints, epochs,
         # pending batches, reclamation gates); reconciled in open() too.
         self.groups = groupsmod.GroupManager(self)
+        # Derived-lineage projection pipelines (/v3/projections).
+        self.projections = projmod.ProjectionManager(self)
 
         self._lock = threading.RLock()
         # Notified on every repair-job terminal transition (used by wait_repair).
@@ -188,6 +191,9 @@ class ArchiveStore:
         # 0a. reconcile interrupted GC evictions (directory swap / manifest
         #     publish / audit append windows) BEFORE verification and before
         #     the generic orphan sweep, exactly like repair reconciliation.
+        #     Projection state is loaded even earlier: active pipelines pin
+        #     source segments, so their dependency set must be known here.
+        self.projections.recover()
         self.gc.recover()
 
         # 0. finish or roll back any interrupted background repair (crash
@@ -201,6 +207,10 @@ class ArchiveStore:
         #     pending batches) and reconcile the gate ledger with them, so
         #     no orphaned or stale reclamation gate survives a crash.
         self.groups.recover()
+
+        # 0c. projection views/pipelines were already loaded before GC
+        #     reconciliation (their dependency pins gate GC eligibility);
+        #     workers are started at the end of open() after WAL replay.
 
         changed = False
         # 1. verify sealed segments, load their indexes
@@ -306,6 +316,10 @@ class ArchiveStore:
                     self._repair_q.put(jid)
         self._start_repair_workers()
         self.gc.start()
+        # Reconcile interrupted projection batches and start the scanning
+        # workers only after the WAL tail and device indexes are rebuilt
+        # (recovered batches re-flush through the normal WAL path).
+        self.projections.start()
 
         log.info(
             "recovery complete: %d segments (%d quarantined), %d live WAL records, "
@@ -401,6 +415,55 @@ class ArchiveStore:
                 self._next_offset = base + len(pending)
                 self._counters["ingested"] += len(pending)
                 self._maybe_seal()
+        return results
+
+    def _append_projection_records(self, records: List[dict]) -> List[dict]:
+        """Append already-formed derived records (WAL fsync before return).
+
+        The records carry their final event ids/seq/flags/provenance, so
+        no user validation or reclassification happens.  A derived event
+        id already present in the target terminal is a harmless duplicate
+        (recovery re-flush): its original offset is returned, the WAL is
+        not rewritten and the count of stored records never increases.
+        Caller HOLDS the global lock.
+        """
+        now = utcnow()
+        base = self._next_offset
+        pending: List[dict] = []
+        pending_ids: Dict[str, int] = {}
+        results: List[dict] = []
+        for rec in records:
+            ev = rec["event"]
+            dev = self._devices.get(ev["device_id"])
+            dup = pending_ids.get(ev["event_id"])
+            if dup is None and dev is not None:
+                dup = dev.event_ids.get(ev["event_id"])
+            if dup is not None:
+                results.append({
+                    "event_id": ev["event_id"], "status": "duplicate",
+                    "offset": dup,
+                })
+                continue
+            rec["offset"] = base + len(pending)
+            pending.append(rec)
+            pending_ids[ev["event_id"]] = rec["offset"]
+            results.append({
+                "event_id": ev["event_id"], "status": "stored",
+                "offset": rec["offset"],
+            })
+        if pending:
+            for rec in pending:
+                self._wal.append(rec)
+            self._wal.fsync()
+            for rec in pending:
+                self._apply(rec)
+            self._next_offset = base + len(pending)
+            self._counters["ingested"] += len(pending)
+            for rec in pending:
+                for k in ("late", "clock_rollback"):
+                    if rec.get("flags", {}).get(k):
+                        self._counters[k] += 1
+            self._maybe_seal()
         return results
 
     def _classify(self, dev: Optional[DeviceState], ev: dict, dt, now) -> dict:
@@ -1403,6 +1466,12 @@ class ArchiveStore:
                                 detail="rebuilt from retained WAL")
         log.info("segment %s rebuilt by %s (version -> %d, %d records)",
                  seg_id, job["id"], meta["version"], meta["count"])
+        # A blocked projection pipeline can now resume at its gap cursor.
+        try:
+            self.projections.notify_repaired(seg_id)
+        except Exception:
+            log.exception("projection repair notification failed for %s",
+                          seg_id)
 
     def _install_segment_index(self, seg_id: str, index: dict) -> None:
         """Replace device entries belonging to seg_id from a rebuilt index."""
@@ -1599,6 +1668,7 @@ class ArchiveStore:
                 "freezes": len(self._freezes),
                 "gc": self.gc._stats_locked(),
                 "groups": self.groups._stats_locked(),
+                "projections": self.projections._stats_locked(),
                 "repairs": {
                     "active": len(self._active_repairs),
                     "queued": sum(1 for j in self._repairs.values()
@@ -1650,6 +1720,9 @@ class ArchiveStore:
         # are requeued at the next startup.
         with self._lock:
             self._closing = True
+        # Stop projection scanners before the WAL is closed; unfinished
+        # pipelines stay journalled and resume at the next startup.
+        self.projections.close()
         self.gc.close()
         for _ in self._repair_workers:
             self._repair_q.put(None)

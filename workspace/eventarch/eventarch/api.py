@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import gc as gcmod
 from . import groups as groupsmod
+from . import projections as projmod
 from . import store as storemod
 
 log = logging.getLogger("eventarch.api")
@@ -79,6 +80,12 @@ class Handler(BaseHTTPRequestHandler):
         except groupsmod.GroupConflict as exc:
             self._error(409, str(exc))
         except groupsmod.GroupGone as exc:
+            self._error(410, str(exc), cursor=exc.cursor,
+                        first_offset=exc.first_offset,
+                        last_offset=exc.last_offset)
+        except projmod.ProjectionConflict as exc:
+            self._error(409, str(exc), conflicts=exc.reasons)
+        except projmod.ProjectionGone as exc:
             self._error(410, str(exc), cursor=exc.cursor,
                         first_offset=exc.first_offset,
                         last_offset=exc.last_offset)
@@ -282,5 +289,49 @@ class Handler(BaseHTTPRequestHandler):
             if action == "resume":
                 return self._send_json(s.groups.resume(parts[2]))
             return self._error(404, "not found")
+
+        # -- derived-lineage projection pipelines (v3) ------------------- #
+
+        if method == "POST" and parts == ["v3", "views"]:
+            body = self._body_json()
+            note = body.get("note", "") if isinstance(body, dict) else ""
+            return self._send_json(s.projections.create_view(note), status=201)
+
+        if method == "GET" and parts == ["v3", "views"]:
+            return self._send_json({"views": s.projections.list_views()})
+
+        if method == "POST" and parts == ["v3", "projections"]:
+            body = self._body_json()
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+            for key in ("pipeline_id", "view_token", "sources",
+                        "from_offset", "to_offset", "recipe",
+                        "recipe_code", "target_prefix"):
+                if key not in body:
+                    raise ValueError(f"body must contain '{key}'")
+            view, created = s.projections.create_pipeline(
+                body["pipeline_id"], body["view_token"], body["sources"],
+                body["from_offset"], body["to_offset"], body["recipe"],
+                body["recipe_code"], body["target_prefix"],
+                body.get("batch_size"),
+                start_paused=bool(body.get("start_paused", False)))
+            return self._send_json(view, status=201 if created else 200)
+
+        if method == "GET" and parts == ["v3", "projections"]:
+            return self._send_json({"pipelines": s.projections.list_pipelines()})
+
+        if method == "GET" and len(parts) == 3 and parts[:2] == ["v3", "projections"]:
+            return self._send_json(s.projections.get_pipeline(parts[2]))
+
+        if method == "POST" and len(parts) == 4 \
+                and parts[:2] == ["v3", "projections"] and parts[3] == "control":
+            body = self._body_json()
+            if not isinstance(body, dict) or "action" not in body \
+                    or "epoch" not in body:
+                raise ValueError("body must contain 'action' and 'epoch'")
+            if body["action"] not in ("pause", "resume", "abort"):
+                raise ValueError("action must be pause|resume|abort")
+            return self._send_json(s.projections.control(
+                parts[2], body["action"], body["epoch"]))
 
         return self._error(404, "not found")

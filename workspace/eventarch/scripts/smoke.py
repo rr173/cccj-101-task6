@@ -218,6 +218,72 @@ def main():
               and stats["segments"]["sealed"] >= 3
               and stats["repairs"]["active"] == 0
               and stats["repairs"]["succeeded"] >= 2)
+
+        print("== 8. derived-lineage projection (/v3) ==")
+        # static view sealed BEFORE the later arrivals
+        vw = req("POST", "/v3/views", {"note": "projection smoke"})
+        horizon = vw["end_offset"]
+        check("view sealed", vw["segment_count"] >= 3 and horizon > 0)
+        recipe = {"seq": {"source": "event.seq"},
+                  "src": {"source": "event_id"},
+                  "kind": {"const": "derived"}}
+        pj = req("POST", "/v3/projections", {
+            "pipeline_id": "smoke-pj", "view_token": vw["token"],
+            "sources": ["dev-A", "dev-B"], "from_offset": 0,
+            "to_offset": horizon, "recipe": recipe,
+            "recipe_code": "RCP-SMOKE", "target_prefix": "agg-"})
+        check("pipeline accepted", pj["pipeline_id"] == "smoke-pj"
+              and pj["cursor"] == 0, str(pj.get("error")))
+        # double click: same pipeline id -> 200 + same object, no new entries
+        same, code200 = req_status("POST", "/v3/projections", {
+            "pipeline_id": "smoke-pj", "view_token": vw["token"],
+            "sources": ["dev-A", "dev-B"], "from_offset": 0,
+            "to_offset": horizon, "recipe": recipe,
+            "recipe_code": "RCP-SMOKE", "target_prefix": "agg-"})
+        check("double click is idempotent (200)", code200 == 200)
+        # changed declaration on same id -> 409
+        diverge, code409 = req_status("POST", "/v3/projections", {
+            "pipeline_id": "smoke-pj", "view_token": vw["token"],
+            "sources": ["dev-A"], "from_offset": 0, "to_offset": horizon,
+            "recipe": recipe, "recipe_code": "RCP-SMOKE",
+            "target_prefix": "agg-"})
+        check("divergent same-id declaration -> 409", code409 == 409)
+
+        term = None
+        for _ in range(200):
+            term = req("GET", "/v3/projections/smoke-pj")
+            if term["status"] in ("succeeded", "failed", "aborted", "blocked"):
+                break
+            time.sleep(0.05)
+        check("pipeline succeeded", term and term["status"] == "succeeded",
+              str(term and term.get("error")))
+        check("derived all sources", term["derived_count"] == horizon
+              and term["cursor"] == horizon,
+              f"{term['derived_count'] if term else '-'} vs {horizon}")
+
+        # target streams are queryable through the ordinary read path
+        agg = req("GET", "/v1/devices/agg-dev-A/events?limit=200")
+        check("aggregated stream visible in normal fetch", len(agg["events"]) >= 1)
+        sample = agg["events"][0]
+        check("derived entry carries bloodline",
+              sample["provenance"]["kind"] == "derived"
+              and sample["provenance"]["pipeline_id"] == "smoke-pj"
+              and sample["provenance"]["recipe_code"] == "RCP-SMOKE"
+              and sample["provenance"]["lineage_id"].startswith("lin-")
+              and sample["event"]["payload"]["kind"] == "derived")
+        # lineage ids in the read stream match the durable derived index
+        streamed_lin = {e["provenance"]["lineage_id"]
+                        for t in ("agg-dev-A", "agg-dev-B")
+                        for e in req(
+                            "GET", f"/v1/devices/{t}/events?limit=200")["events"]}
+        check("lineage index matches streams",
+              streamed_lin == {e["lineage_id"] for e in term["derived"]})
+        # control with a stale epoch is rejected
+        _body, code_stale = req_status(
+            "POST", "/v3/projections/smoke-pj/control",
+            {"action": "abort", "epoch": 1})
+        check("stale control token on terminal pipeline -> 409",
+              code_stale == 409)
     finally:
         stop_server(proc)
         shutil.rmtree(data_dir, ignore_errors=True)
