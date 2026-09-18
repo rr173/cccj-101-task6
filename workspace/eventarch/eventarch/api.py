@@ -9,6 +9,7 @@ from urllib.parse import parse_qs, urlparse
 
 from . import gc as gcmod
 from . import groups as groupsmod
+from . import projections as projmod
 from . import store as storemod
 
 log = logging.getLogger("eventarch.api")
@@ -78,6 +79,8 @@ class Handler(BaseHTTPRequestHandler):
             self._error(409, str(exc), conflicts=exc.reasons)
         except groupsmod.GroupConflict as exc:
             self._error(409, str(exc))
+        except projmod.ProjectionConflict as exc:
+            self._error(409, str(exc), conflicts=exc.reasons)
         except groupsmod.GroupGone as exc:
             self._error(410, str(exc), cursor=exc.cursor,
                         first_offset=exc.first_offset,
@@ -282,5 +285,39 @@ class Handler(BaseHTTPRequestHandler):
             if action == "resume":
                 return self._send_json(s.groups.resume(parts[2]))
             return self._error(404, "not found")
+
+        # -- derived-lineage projection pipelines (v3) ------------------- #
+
+        if method == "POST" and parts == ["v3", "projections"]:
+            body = self._body_json()
+            if not isinstance(body, dict):
+                raise ValueError("body must be an object")
+            for key in ("pipeline_id", "sources", "view_token",
+                        "start_cursor", "end_cursor", "recipe",
+                        "recipe_code", "target_prefix"):
+                if key not in body:
+                    raise ValueError(f"body must contain '{key}'")
+            view, created = s.projections.create(
+                body["pipeline_id"], body["view_token"], body["sources"],
+                body["start_cursor"], body["end_cursor"], body["recipe"],
+                body["recipe_code"], body["target_prefix"])
+            return self._send_json(view, status=201 if created else 200)
+
+        if method == "GET" and parts == ["v3", "projections"]:
+            limit = _clamp_limit(q.get("limit"), 100, 1000)
+            return self._send_json(s.projections.list_pipelines(limit=limit))
+
+        if method == "GET" and len(parts) == 3 and parts[:2] == ["v3", "projections"]:
+            return self._send_json(s.projections.get(parts[2]))
+
+        if method == "POST" and len(parts) == 4 \
+                and parts[:2] == ["v3", "projections"] \
+                and parts[3] in ("pause", "resume", "revoke"):
+            body = self._body_json()
+            if not isinstance(body, dict) or "gen" not in body:
+                raise ValueError("body must contain the integer 'gen' "
+                                 "control token")
+            return self._send_json(s.projections.control(
+                parts[2], parts[3], body["gen"]))
 
         return self._error(404, "not found")

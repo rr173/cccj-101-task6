@@ -31,6 +31,7 @@ from typing import Dict, List, Optional, Tuple
 
 from . import gc as gcmod
 from . import groups as groupsmod
+from . import projections as projmod
 from . import segments as segmod
 from . import wal as walmod
 from .models import fmt_ts, new_flags, parse_ts, utcnow, validate_event
@@ -132,6 +133,9 @@ class ArchiveStore:
         # Persistent consumer groups (declarations, checkpoints, epochs,
         # pending batches, reclamation gates); reconciled in open() too.
         self.groups = groupsmod.GroupManager(self)
+        # Derived-lineage projection pipelines (/v3/projections): journal,
+        # cursor, derived index, dependency pins and terminal answers.
+        self.projections = projmod.ProjectionManager(self)
 
         self._lock = threading.RLock()
         # Notified on every repair-job terminal transition (used by wait_repair).
@@ -150,6 +154,7 @@ class ArchiveStore:
         self._counters = {
             "ingested": 0, "duplicates": 0, "late": 0,
             "clock_rollback": 0, "seq_conflict": 0, "rejected": 0,
+            "derived": 0,
         }
         self._started_at = time.monotonic()
         self._janitor_stop = threading.Event()
@@ -201,7 +206,6 @@ class ArchiveStore:
         #     pending batches) and reconcile the gate ledger with them, so
         #     no orphaned or stale reclamation gate survives a crash.
         self.groups.recover()
-
         changed = False
         # 1. verify sealed segments, load their indexes
         seg_indexes: Dict[str, dict] = {}
@@ -275,6 +279,12 @@ class ArchiveStore:
         # resume cursors after a restart.
         self.gc.attach_evicted_indexes()
 
+        # 4b. load projection journals and reconcile their derived indexes
+        #     against the rebuilt dedup table.  Must run AFTER all live
+        #     records (WAL tail) are applied, so a batch flushed just before
+        #     a crash is resolvable to its archive offsets.
+        self.projections.recover()
+
         self._next_offset = max(
             sealed_through + 1,
             (live[-1]["offset"] + 1) if live else 0,
@@ -306,6 +316,7 @@ class ArchiveStore:
                     self._repair_q.put(jid)
         self._start_repair_workers()
         self.gc.start()
+        self.projections.start()
 
         log.info(
             "recovery complete: %d segments (%d quarantined), %d live WAL records, "
@@ -401,6 +412,66 @@ class ArchiveStore:
                 self._next_offset = base + len(pending)
                 self._counters["ingested"] += len(pending)
                 self._maybe_seal()
+        return results
+
+    def _ingest_derived_locked(self, pipeline_id: str, recipe_code: str,
+                               events: List[dict], generated_at: str
+                               ) -> List[dict]:
+        """Ingest a projection batch's already-synthesized derived events.
+
+        Caller HOLDS the store lock.  Derived events travel the exact same
+        durability path as normal ingestion (one WAL append + one fsync,
+        then in-memory apply) and the same classification/dedup machinery,
+        so ordinary streams see them with terminal sequencing and the
+        late/clock-rollback/seq-conflict markers intact.  Deterministic
+        event ids (recipe + lineage number) make a replayed crash batch
+        collapse onto the identical offsets -- never a double entry.
+        """
+        base = self._next_offset
+        now = utcnow()
+        pending: List[dict] = []
+        results: List[dict] = []
+        for ev in events:
+            dev = self._devices.get(ev["device_id"])
+            dup_offset = dev.event_ids.get(ev["event_id"]) if dev else None
+            if dup_offset is not None:
+                self._counters["duplicates"] += 1
+                results.append({
+                    "event_id": ev["event_id"], "device_id": ev["device_id"],
+                    "status": "duplicate", "offset": dup_offset,
+                    "generated_at": generated_at,
+                })
+                continue
+            flags = self._classify(dev, ev, parse_ts(ev["device_ts"]), now)
+            rec = {
+                "offset": base + len(pending),
+                "ingest_ts": fmt_ts(now),
+                "event": ev,
+                "flags": flags,
+                "derived": {
+                    "pipeline_id": pipeline_id,
+                    "recipe": recipe_code,
+                    "source_offset": ev["source_offset"],
+                    "lineage_no": ev["source_offset"],
+                    "generated_at": generated_at,
+                },
+            }
+            pending.append(rec)
+            results.append({
+                "event_id": ev["event_id"], "device_id": ev["device_id"],
+                "status": "stored", "offset": rec["offset"],
+                "generated_at": generated_at,
+            })
+        if pending:
+            for rec in pending:
+                self._wal.append(rec)
+            self._wal.fsync()
+            for rec in pending:
+                self._apply(rec)
+            self._next_offset = base + len(pending)
+            self._counters["ingested"] += len(pending)
+            self._counters["derived"] += len(pending)
+            self._maybe_seal()
         return results
 
     def _classify(self, dev: Optional[DeviceState], ev: dict, dt, now) -> dict:
@@ -504,6 +575,10 @@ class ArchiveStore:
             keep_from = sealed[-self.cfg.wal_retain_segments]["first_offset"]
         pinned = [m["first_offset"] for m in self.manifest["segments"]
                   if m["status"] == "quarantined" or m["id"] in self._active_repairs]
+        # Unfinished projection pipelines must keep rebuild coverage for
+        # every dependency segment they still need to scan.
+        pinned.extend(m["first_offset"] for m in self.manifest["segments"]
+                      if m["id"] in self.projections.dependency_ids_locked())
         if pinned:
             keep_from = min(keep_from, min(pinned))
         return keep_from
@@ -1599,6 +1674,7 @@ class ArchiveStore:
                 "freezes": len(self._freezes),
                 "gc": self.gc._stats_locked(),
                 "groups": self.groups._stats_locked(),
+                "projections": self.projections._stats_locked(),
                 "repairs": {
                     "active": len(self._active_repairs),
                     "queued": sum(1 for j in self._repairs.values()
@@ -1651,6 +1727,7 @@ class ArchiveStore:
         with self._lock:
             self._closing = True
         self.gc.close()
+        self.projections.close()
         for _ in self._repair_workers:
             self._repair_q.put(None)
         for t in self._repair_workers:

@@ -23,6 +23,9 @@ class Config:
     repair_history: int = 100             # finished jobs retained in the journal
     gc_workers: int = 1                   # background eviction-job concurrency
     gc_history: int = 100                 # finished gc jobs retained in the journal
+    projection_workers: int = 2           # background projection-pipeline concurrency
+    projection_batch_size: int = 200      # source records per derived batch
+    projection_recheck_sec: float = 0.2   # blocked-pipeline re-enqueue cadence
 
     @classmethod
     def from_env(cls) -> "Config":
@@ -49,4 +52,10 @@ class Config:
             repair_history=env("EA_REPAIR_HISTORY", cls.repair_history, int),
             gc_workers=env("EA_GC_WORKERS", cls.gc_workers, int),
             gc_history=env("EA_GC_HISTORY", cls.gc_history, int),
+            projection_workers=env("EA_PROJECTION_WORKERS",
+                                   cls.projection_workers, int),
+            projection_batch_size=env("EA_PROJECTION_BATCH_SIZE",
+                                      cls.projection_batch_size, int),
+            projection_recheck_sec=env("EA_PROJECTION_RECHECK_SEC",
+                                       cls.projection_recheck_sec, float),
         )

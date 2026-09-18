@@ -480,6 +480,10 @@ class GCManager:
         # checkpoint hold unsettled/unread messages and are untouchable.
         groups = getattr(self.s, "groups", None)
         group_bounds = groups.gate_boundaries_locked() if groups else []
+        # Unfinished projection pipelines pin their whole dependency set
+        # until they complete or are revoked.
+        projections = getattr(self.s, "projections", None)
+        proj_pins = projections.dependency_ids_locked() if projections else set()
         out = []
         for m in self.s.manifest["segments"]:
             if m["status"] != "sealed":
@@ -487,7 +491,7 @@ class GCManager:
             if m["last_offset"] >= cut:
                 continue
             if m["id"] in snap or m["id"] in active_repairs \
-                    or m["id"] in self._pending:
+                    or m["id"] in self._pending or m["id"] in proj_pins:
                 continue
             if self._is_held_locked(m, now):
                 continue
@@ -611,6 +615,10 @@ class GCManager:
             if m["id"] in pending_snapshot:
                 reasons.append(f"{it['id']}: already being evicted by "
                                f"{pending_snapshot[m['id']]}")
+            proj_pins = getattr(self.s, "projections", None)
+            if proj_pins is not None and m["id"] in proj_pins.dependency_ids_locked():
+                reasons.append(f"{it['id']}: pinned by an unfinished "
+                               f"projection pipeline")
             if any(m["first_offset"] >= h["boundary"] for h in holds):
                 reasons.append(f"{it['id']}: covered by a reader hold")
             try:

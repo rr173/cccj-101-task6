@@ -98,7 +98,10 @@ make smoke    # 端到端：起服务→分类→冻结→重启→损坏→隔�
 | `POST /v2/groups/{name}/settle` | 交卷 `{holder, lease_key, batch_key, next_at}`；重复提交视为办妥；倒退/跨批/虚构批号/失效凭证 `409` 且 checkpoint 不动 |
 | `POST /v2/groups/{name}/pause` · `POST /v2/groups/{name}/resume` | 暂停（撤水闸、释放租约）/ 从原 checkpoint 恢复 |
 | `DELETE /v2/groups/{name}` | 注销：撤水闸、删除登记 |
-| `GET /v1/stats` · `GET /v1/healthz` | 运行指标（含 `gc` 段）/ 健康检查 |
+| `POST /v3/projections` | 登记/幂等复用一条派生谱系管线（见下）；同号异声明 `409`，原管线照旧 |
+| `GET /v3/projections` · `GET /v3/projections/{id}` | 管线清单 / 恒定答复（阶段、输入视界摘要、派生条目清单、接续游标、缺口） |
+| `POST /v3/projections/{id}/{pause\|resume\|revoke}` | 单调代数控制；过期代数令牌 `409`，旧令牌无法改写新阶段 |
+| `GET /v1/stats` · `GET /v1/healthz` | 运行指标（含 `gc`/`groups`/`projections` 段）/ 健康检查 |
 
 ### 冻结与回放
 
@@ -284,6 +287,95 @@ curl -XPOST localhost:8080/v2/groups/etl/settle \
 - **不阻塞前台**：领取的段扫描 I/O 在全局锁外进行（与 replay 相同），订阅
   不会拖慢常规接入、查找、冻结、整治或容量回收。
 
+## 派生谱系管线（/v3/projections）
+
+异步地按一个**已声明的静态视图**（freeze 令牌）扫描原始条目，经字段配方产成
+带血缘的派生条目，写入以目标前缀编排的新终端流；派生条目走的是与普通接入完全
+相同的落盘/去重/终端序号/打标路径，普通流取数（设备业务序查询、回放）直接可见。
+
+```bash
+# 视图先冻结：之后到达的内容永远不会进入这条管线
+frz=$(curl -s -XPOST localhost:8080/v1/freeze -d '{"note":"nightly-derived"}')
+
+curl -s -XPOST localhost:8080/v3/projections -d '{
+  "pipeline_id": "prj-20260918-01",      // 跨进程幂等钥匙（唯一管线号）
+  "view_token": "frz-…",                 // 只允许取该声明视图
+  "sources": ["dev-A", "dev-B"],         // 源端白名单（终端级）
+  "start_cursor": 0,                     // 首游标（含）
+  "end_cursor": 1200,                    // 尾游标（不含，<= 视图视界）
+  "recipe": {"temp": "payload.temp", "who": "device_id"},  // 字段配方
+  "recipe_code": "temp-v2",              // 配方代号
+  "target_prefix": "derived/"            // 目标前缀，目标终端 = 前缀 + 源终端
+}'
+# 答复格式恒定：stages / declaration / view / derived / gaps / cursor / depends_on …
+# 201 首次受理；同号同声明再次 POST 恒为 200 同一对象（连点、双 worker、迟到重试）
+```
+
+语义要点：
+
+- **同号幂等**：管线号是跨进程幂等钥匙，并发同时开启只留下一条管线、一套派生
+  条目。同号请求若更改视图、首尾游标、配方、白名单或前缀 → 整单 `409`
+  （`conflicts[]` 逐条给因），原管线照旧运行、清单不变。
+- **恒定派生身份**：派生事件 id = `f(recipe_code, lineage_no)`，血缘条目号
+  （`lineage_no`）即源 offset。同号配方再次运行同一终端时，血缘条目映射恒定，
+  重复扫描经去重落到**相同 offset**，绝不双份条目。不同配方写同一目标终端
+  （前缀 + 源端）是双边冲突：后到者 `409`，占用方的 `conflicts[]` 也被标注；
+  只有占用方**撤销**后该终端才释放。
+- **静态视界封口**：只扫描视图 `segments` 中、offset 低于 `end_offset` 的条目；
+  视图以后抵达的原始内容物理上无法混入。`end_cursor > 视图视界` 直接 `409`。
+- **缺口不藏**：扫描到被封存（quarantine/隔离，或已清退）的源分片时管线进入
+  `blocked`：`gaps[]` 给出 `{segment, reason, first_offset, last_offset,
+  resume_offset, terminals}`——**精确接续游标**（缺口愈合后从该 offset 续跑）和
+  受影响目标终端，绝不静默跳过。修复分片后管线自动从该游标继续；扫描期间分片
+  代数漂移（修复换位）则丢弃本批过时落盘、重新核对再跑。
+- **暂停 / 恢复 / 撤销**：动作 body 携带当前单调代数 `gen`，每次生效的状态迁移
+  代数 +1；过期/回退代数一律 `409`，旧控制令牌严禁改写新阶段（worker 每批以
+  开工时的代数做栅栏，被暂停/撤销的批次整批丢弃）。撤销只停止后续派生，已刷盘
+  条目保留可查；撤销答复永久冻结。
+- **占用依赖分片**：未完管线（queued/running/blocked/paused）持续钉住依赖分片，
+  GC 预演自动排除；完成或撤销后才释放占用、进入清退候选（修复用 WAL 覆盖窗口
+  也一并钉住）。
+- **崩溃安全（四个强制中止点）**：管线清单、接续游标、派生索引、依赖分片集合与
+  终态答复保存在 `state/projections.json`（原子替换）。下列动作之前各有一个强制
+  中止注入点（测试钩子）：①清单落盘 ②单批派生条目刷盘（WAL fsync）③游标/派生
+  索引发布 ④终态标记。重新开机只从**最后完整批**续跑：②③之间崩溃时，已落盘的
+  条目以恒定身份重扫去重为同一 offset，既无半条、也无两份、也不会跳过缺口。
+- **不拖访问方**：分段扫描的全部重 I/O 在全局锁之外，与普通摄取、终端查找、视图
+  创建、修复整治、空间回收同时进行；暂停/恢复/撤销与这些路径并行不串写。
+
+派生条目记录形如（普通设备查询/回放原样返回）：
+
+```json
+{
+  "offset": 27, "ingest_ts": "…",
+  "event": {"device_id": "derived/dev-A", "event_id": "lin:temp-v2:000…0042",
+            "seq": 42, "device_ts": "…（沿用源设备时刻）",
+            "payload": {"temp": 21.5, "who": "dev-A"}},
+  "flags": {"late": false, "duplicate": false,
+            "clock_rollback": true, "seq_conflict": false},
+  "derived": {"pipeline_id": "prj-…", "recipe": "temp-v2",
+              "source_offset": 42, "lineage_no": 42,
+              "generated_at": "2026-09-18T…Z"}
+}
+```
+
+`GET /v3/projections/{id}` 的恒定答复：
+
+| 键 | 内容 |
+|---|---|
+| `status` / `stage` / `gen` | queued·running·blocked·paused / completed·revoked；当前控制代数 |
+| `stages` | 管线阶段流水（created/paused/resumed/revoked/completed + 时刻） |
+| `declaration` | 视图令牌、白名单、首尾游标、配方、配方代号、目标前缀 |
+| `view` | 输入视界摘要：`end_offset`、引用分片集合及数量 |
+| `derived` | 派生条目清单：血缘条目号、源 offset、落库 offset、事件 id、目标终端、配方代号、生成时刻 |
+| `gaps` | 源分片缺口：分片、原因、offset 区间、精确 `resume_offset`、受影响终端 |
+| `cursor` | 接续游标（下一个待扫描 offset） |
+| `depends_on` | 依赖的分片集合（GC 占用依据） |
+| `conflicts` | 双边占用冲突留痕 |
+
+> 目标前缀若含 `/`，目标终端仍可经回放（`/v1/replay`）与派生清单看到；要直接用
+> `/v1/devices/{id}/events` 按终端查询时，选用不含 `/` 的前缀。
+
 ## 持久化与故障语义
 
 ```
@@ -301,6 +393,7 @@ $data_dir/
   state/holds.json                 # 读者保护区（hold_id/pos/边界/过期时刻）
   state/groups.json                # 消费组声明、checkpoint、epoch、租约、待交卷批次
   state/group_gates.json           # 回收水闸台账（由 checkpoint 派生，启动对账）
+  state/projections.json           # 派生谱系管线：清单、接续游标、派生索引、依赖集、终态答复
   segments/stage-<job>-<n>/<seg>/  # 修复候选（提交前不触碰 live）
   segments/bak-<job>-<n>/<seg>/    # 原子交换期间的旧段（提交后删除）
   segments/gcgrave-<job>/<seg>/    # GC 目录换位后、audit 前的临时墓场
@@ -332,6 +425,9 @@ $data_dir/
 | `EA_REPAIR_HISTORY` | `100` | 作业日志保留的终态作业条数（活动作业不裁剪） |
 | `EA_GC_WORKERS` | `1` | 后台清退作业并发工作线程数 |
 | `EA_GC_HISTORY` | `100` | 清退作业日志保留的终态作业条数（活动作业不裁剪） |
+| `EA_PROJECTION_WORKERS` | `2` | 派生谱系管线后台并发工作线程数 |
+| `EA_PROJECTION_BATCH_SIZE` | `200` | 单批扫描/派生的源条目数（崩溃续跑粒度） |
+| `EA_PROJECTION_RECHECK_SEC` | `0.2` | blocked 管线（等待分片修复）的重新入队节拍 |
 
 ## 设计取舍与限制
 
